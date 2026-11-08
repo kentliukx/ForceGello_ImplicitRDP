@@ -58,6 +58,8 @@ Please refer to [docs/customized_deployment_guide.md](docs/customized_deployment
 </p>
 
 ### Software
+For the Ubuntu 24.04 conda/RoboStack setup, see [the local setup guide (Chinese)](docs/conda_setup_zh.md).
+
 1. Follow the [official document](https://docs.ros.org/en/humble/Installation/Ubuntu-Install-Debs.html) to install ROS2 Humble.
 2. Since ROS2 has some compatibility issues with Conda, we recommend using a virtual environment with `venv`.
    ```bash

@@ -140,6 +140,7 @@ dmypy.json
 
 # Virtual environment
 implicitrdp_venv/
+.conda/
 
 # Editor settings
 .vscode/

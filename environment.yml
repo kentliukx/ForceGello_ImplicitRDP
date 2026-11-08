@@ -1,0 +1,18 @@
+name: implicitrdp
+channels:
+  - conda-forge
+  - robostack-jazzy
+  - nodefaults
+dependencies:
+  - python=3.12
+  - pip
+  - setuptools<81
+  - python-dateutil<3
+  - numpy=1.26.4
+  - py-opencv>=4.10,<5
+  - ros-jazzy-ros-base
+  - ros-jazzy-cv-bridge
+  - ros-jazzy-sensor-msgs
+  - ros-jazzy-geometry-msgs
+  - ros-jazzy-message-filters
+  - ros-jazzy-demo-nodes-cpp

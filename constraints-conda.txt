@@ -1,0 +1,24 @@
+# Compatibility constraints for Python 3.12 and the project's PyTorch 2.2 stack.
+numpy==1.26.4
+torch==2.2.2
+torchvision==0.17.2
+torchaudio==2.2.2
+# ReplayBuffer uses the Zarr 2 API; Zarr 3 is incompatible.
+zarr==2.18.7
+numcodecs==0.15.1
+# Keep the Hugging Face stack compatible with PyTorch 2.2.
+diffusers==0.33.1
+transformers==4.51.3
+peft==0.15.2
+accelerate==1.6.0
+timm==1.0.15
+datasets==3.5.0
+# Newer Arrow wheels can require NumPy 2 at import time.
+pyarrow==19.0.1
+numba==0.61.2
+scipy==1.15.3
+rerun-sdk==0.23.1
+# OpenCV is supplied by conda so cv_bridge uses the same native libraries.
+opencv-python>=4.10,<5
+setuptools<81
+python-dateutil<3
