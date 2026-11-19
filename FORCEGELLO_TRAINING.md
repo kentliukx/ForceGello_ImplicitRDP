@@ -28,6 +28,30 @@ visual latent stage.
 
 The task config uses the right arm, external camera, and right wrist camera.
 Training defaults to CUDA device 0, batch size 8, and offline wandb logging.
+As in RDP, `logs.json.txt` records `train_loss` for every training mini-batch
+and an epoch average at the last step. It evaluates the full validation set
+once per epoch and records `val_loss_raw` and `val_loss_ema` on the same batches
+with matching diffusion noise. The existing `val_loss` key remains the EMA
+validation loss for older plots and checkpoint naming.
+
+The first `checkpoints/latest.ckpt` is written after epoch 0 finishes, then
+after epochs 10, 20, and so on. Separate deployment checkpoints are saved
+after every 10 completed epochs as `checkpoints/epoch=0010-deploy.ckpt`,
+`epoch=0020-deploy.ckpt`, etc. They contain the EMA policy and its normalizer
+without the raw model or optimizer; use `latest.ckpt` to resume training.
+To continue an interrupted run, point Hydra
+at that same output directory:
+
+```bash
+python train.py --config-name=train_forcegello_right_implicitrdp \
+  training.resume=true \
+  hydra.run.dir=/absolute/path/to/the/original/output/directory
+```
+
+The initial run started with `training.resume=false`, so its checkpoints omit
+the optimizer state. The first restart restores model, EMA, and progress but
+uses a fresh optimizer; subsequent `latest.ckpt` files from the resumed run
+include optimizer state. The best deployment checkpoint remains weights-only.
 
 After retraining with this config, verify the checkpoint without opening CAN
 or cameras:

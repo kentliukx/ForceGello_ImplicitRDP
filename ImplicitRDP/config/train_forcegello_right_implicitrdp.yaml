@@ -27,6 +27,10 @@ val_dataloader:
 training:
   rollout_every: 1000000
 
+checkpoint:
+  # Keep a separate inference-only EMA checkpoint every 10 completed epochs.
+  deploy_every: 10
+
 logging:
   project: forcegello_implicitrdp
   mode: offline

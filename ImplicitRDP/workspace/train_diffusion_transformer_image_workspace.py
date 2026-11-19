@@ -118,9 +118,18 @@ class TrainDiffusionTransformerImageWorkspace(BaseWorkspace):
         if cfg.training.resume:
             assert cfg.training.pretrained_ckpt_path is None, "pretrained_ckpt_path and resume cannot be used together"
             lastest_ckpt_path = self.get_checkpoint_path()
-            if lastest_ckpt_path.is_file():
-                print(f"Resuming from checkpoint {lastest_ckpt_path}")
-                self.load_checkpoint(path=lastest_ckpt_path)
+            if not lastest_ckpt_path.is_file():
+                raise FileNotFoundError(f"Cannot resume: checkpoint does not exist: {lastest_ckpt_path}")
+            print(f"Resuming from checkpoint {lastest_ckpt_path}")
+            payload = self.load_checkpoint(
+                path=lastest_ckpt_path,
+                include_keys=('global_step', 'epoch'),
+            )
+            if 'optimizer' not in payload['state_dicts']:
+                print("Warning: checkpoint has no optimizer state; weights and EMA resume with a fresh optimizer")
+            # Checkpoints are written before the epoch-end counters advance.
+            self.epoch += 1
+            self.global_step += 1
 
         # init model from pretrained checkpoint
         if cfg.training.pretrained_ckpt_path is not None:
@@ -185,6 +194,10 @@ class TrainDiffusionTransformerImageWorkspace(BaseWorkspace):
             self.ema_model.set_normalizer(normalizer)
 
         # configure lr scheduler
+        # A checkpoint from a run with resume=false has no optimizer state.
+        # PyTorch requires initial_lr when rebuilding a scheduler past step 0.
+        for param_group in self.optimizer.param_groups:
+            param_group.setdefault('initial_lr', param_group['lr'])
         lr_scheduler = get_scheduler(
             cfg.training.lr_scheduler,
             optimizer=self.optimizer,
@@ -259,7 +272,7 @@ class TrainDiffusionTransformerImageWorkspace(BaseWorkspace):
         # training loop
         log_path = os.path.join(self.output_dir, 'logs.json.txt')
         with JsonLogger(log_path) as json_logger:
-            for local_epoch_idx in range(cfg.training.num_epochs):
+            for local_epoch_idx in range(self.epoch, cfg.training.num_epochs):
                 self.model.train()
 
                 step_log = dict()
@@ -333,29 +346,43 @@ class TrainDiffusionTransformerImageWorkspace(BaseWorkspace):
                 step_log['train_loss'] = train_loss
 
                 # ========= eval for this epoch ==========
-                policy = accelerator.unwrap_model(self.model)
+                raw_policy = accelerator.unwrap_model(self.model)
+                policy = self.ema_model if cfg.training.use_ema else raw_policy
+                raw_policy.eval()
                 if cfg.training.use_ema:
-                    policy = self.ema_model
-                policy.eval()
+                    policy.eval()
 
                 # run validation
                 if (self.epoch % cfg.training.val_every) == 0 and len(val_dataloader) > 0 and accelerator.is_main_process:
                     with torch.no_grad():
-                        val_losses = list()
+                        raw_val_losses = list()
+                        ema_val_losses = list()
                         with tqdm.tqdm(val_dataloader, desc=f"Validation epoch {self.epoch}", 
                                 leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                             for batch_idx, batch in enumerate(tepoch):
                                 batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
+                                # Give the raw and EMA policies the same sampled
+                                # diffusion noise and timestep for a fair comparison.
+                                cpu_rng_state = torch.get_rng_state()
+                                cuda_rng_state = torch.cuda.get_rng_state(device) if device.type == 'cuda' else None
                                 with autocast(enabled=use_amp, dtype=amp_dtype):
-                                    loss = policy.compute_diffusion_loss(batch)
-                                    val_losses.append(loss)
+                                    raw_loss = raw_policy.compute_diffusion_loss(batch)
+                                    raw_val_losses.append(raw_loss.item())
+                                    if cfg.training.use_ema:
+                                        torch.set_rng_state(cpu_rng_state)
+                                        if cuda_rng_state is not None:
+                                            torch.cuda.set_rng_state(cuda_rng_state, device)
+                                        ema_loss = self.ema_model.compute_diffusion_loss(batch)
+                                        ema_val_losses.append(ema_loss.item())
                                 if (cfg.training.max_val_steps is not None) \
                                     and batch_idx >= (cfg.training.max_val_steps-1):
                                     break
-                        if len(val_losses) > 0:
-                            val_loss = torch.mean(torch.tensor(val_losses)[~torch.isnan(torch.tensor(val_losses))]).item()
-                            # log epoch average validation loss
-                            step_log['val_loss'] = val_loss
+                        if raw_val_losses:
+                            step_log['val_loss_raw'] = float(np.nanmean(raw_val_losses))
+                            if cfg.training.use_ema:
+                                step_log['val_loss_ema'] = float(np.nanmean(ema_val_losses))
+                            # Keep the existing key for older plots/checkpoints.
+                            step_log['val_loss'] = step_log.get('val_loss_ema', step_log['val_loss_raw'])
 
                 def log_action_mse(step_log, category, pred_action, gt_action):
                     action_type = cfg.task.env_runner.action_type
@@ -402,31 +429,51 @@ class TrainDiffusionTransformerImageWorkspace(BaseWorkspace):
                         del gt_action
                         del pred_action
                 
-                # checkpoint
-                if (self.epoch % cfg.training.checkpoint_every) == 0 and accelerator.is_main_process:
+                # Save the regular training checkpoint and independent periodic
+                # deployment weights on their respective epoch schedules.
+                training_ckpt_due = (self.epoch % cfg.training.checkpoint_every) == 0
+                deploy_every = cfg.checkpoint.get('deploy_every', 0)
+                deploy_ckpt_due = deploy_every > 0 and (self.epoch + 1) % deploy_every == 0
+                if (training_ckpt_due or deploy_ckpt_due) and accelerator.is_main_process:
                     # unwrap the model to save ckpt
                     model_ddp = self.model
                     self.model = accelerator.unwrap_model(self.model)
 
                     # checkpointing
-                    if cfg.checkpoint.save_last_ckpt:
+                    if training_ckpt_due and cfg.checkpoint.save_last_ckpt:
                         self.save_checkpoint()
-                    if cfg.checkpoint.save_last_snapshot:
+                    if training_ckpt_due and cfg.checkpoint.save_last_snapshot:
                         self.save_snapshot()
 
-                    # sanitize metric names
-                    metric_dict = dict()
-                    for key, value in step_log.items():
-                        new_key = key.replace('/', '_')
-                        metric_dict[new_key] = value
-                    
-                    # We can't copy the last checkpoint here
-                    # since save_checkpoint uses threads.
-                    # therefore at this point the file might have been empty!
-                    topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
+                    if training_ckpt_due:
+                        # Sanitize metric names for the existing top-k saver.
+                        metric_dict = dict()
+                        for key, value in step_log.items():
+                            new_key = key.replace('/', '_')
+                            metric_dict[new_key] = value
 
-                    if topk_ckpt_path is not None:
-                        self.save_checkpoint(path=topk_ckpt_path)
+                        # We can't copy latest here since it is saved in a thread.
+                        topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
+                        if topk_ckpt_path is not None:
+                            self.save_checkpoint(
+                                path=topk_ckpt_path,
+                                exclude_keys=('optimizer', 'scaler'),
+                            )
+
+                    if deploy_ckpt_due:
+                        # Inference selects EMA when enabled; retain only the
+                        # required model and normalizer, without optimizer state.
+                        deploy_exclude = ('optimizer', 'scaler', 'model') if cfg.training.use_ema else (
+                            'optimizer', 'scaler', 'ema_model')
+                        deploy_path = os.path.join(
+                            self.output_dir, 'checkpoints',
+                            f'epoch={self.epoch + 1:04d}-deploy.ckpt',
+                        )
+                        self.save_checkpoint(
+                            path=deploy_path,
+                            exclude_keys=deploy_exclude,
+                            use_thread=False,
+                        )
 
                     # recover the DDP model
                     self.model = model_ddp
