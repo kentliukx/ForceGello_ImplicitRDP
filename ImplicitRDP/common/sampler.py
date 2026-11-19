@@ -169,7 +169,8 @@ class SequenceSampler:
                 # fill value with Nan to catch bugs
                 # the non-loaded region should never be used
                 sample = np.full((n_data,) + input_arr.shape[1:], 
-                    fill_value=np.nan, dtype=input_arr.dtype)
+                    fill_value=np.nan if np.issubdtype(input_arr.dtype, np.floating) else 0,
+                    dtype=input_arr.dtype)
                 try:
                     sample[:k_data] = input_arr[buffer_start_idx:buffer_start_idx+k_data]
                 except Exception as e:

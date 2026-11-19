@@ -1,0 +1,32 @@
+defaults:
+  - train_reactive_diffusion_transformer_real_image_workspace
+  - override task: real_forcegello_right_implicitrdp_20fps
+  - _self_
+
+# The first predicted 7D joint/gripper command is paired with current
+# proprioception and images from the preceding 20 Hz tick, and targets t+50 ms.
+horizon: 20
+n_obs_steps: 5
+dataset_obs_steps: ${n_obs_steps}
+n_action_steps: ${eval:'${horizon}-${dataset_obs_steps}+1'}
+
+dataloader:
+  batch_size: 8
+  num_workers: 4
+  shuffle: true
+  pin_memory: true
+  persistent_workers: true
+
+val_dataloader:
+  batch_size: 8
+  num_workers: 4
+  shuffle: false
+  pin_memory: true
+  persistent_workers: true
+
+training:
+  rollout_every: 1000000
+
+logging:
+  project: forcegello_implicitrdp
+  mode: offline

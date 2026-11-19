@@ -242,7 +242,7 @@ def get_action_normalizer(actions: np.ndarray, temporally_independent_normalizat
         actions = actions.reshape(-1, actions.shape[-1])
 
     D = actions.shape[-1]
-    if D == 3 or D == 4 or D == 6 or D == 8 or D == 12 or D == 13 or 19:
+    if D in (3, 4, 6, 7, 8, 12, 13, 19):
         normalizers = [get_range_normalizer_from_stat(array_to_stats(actions))]
     elif D == 9 or D == 10: # (x, y, z, rx1, rx2, rx3, ry1, ry2, ry3)
         normalizers = []

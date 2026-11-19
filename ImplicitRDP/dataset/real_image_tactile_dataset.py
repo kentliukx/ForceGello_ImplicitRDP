@@ -45,10 +45,24 @@ class RealImageTactileDataset(BaseImageDataset):
                  relative_tcp_obs_for_relative_action=True,
                  rpy_for_rotation=False,
                  transform_params=None,
+                 sample_hz=None,
+                 sample_phase=None,
+                 visual_latency_steps=0,
                  ):
         assert os.path.isdir(dataset_path)
 
-        action_key = ["action"]
+        self.action_key = shape_meta['action'].get('key', 'action')
+        self.action_space = shape_meta['action'].get('space', 'cartesian')
+        self.forcegello_sampling = sample_hz is not None
+        if sample_hz is not None and (self.action_space not in ('joint', 'tcp_delta') or delta_action or relative_action or rpy_for_rotation):
+            raise ValueError('ForceGello resampling requires unmodified joint or TCP delta actions')
+        self.visual_latency_steps = int(visual_latency_steps)
+        if self.visual_latency_steps != visual_latency_steps or self.visual_latency_steps < 0:
+            raise ValueError('visual_latency_steps must be a non-negative integer')
+        if sample_hz is None and (sample_phase is not None or self.visual_latency_steps):
+            raise ValueError('sample_phase and visual latency require ForceGello sampling')
+
+        action_key = [self.action_key]
 
         rgb_keys = list()
         lowdim_keys = list()
@@ -73,8 +87,14 @@ class RealImageTactileDataset(BaseImageDataset):
         self.zarr_path = os.path.join(dataset_path, 'replay_buffer.zarr')
         zarr_load_keys = set(action_key + rgb_keys + lowdim_keys + extended_rgb_keys + extended_lowdim_keys)
         zarr_load_keys = list(filter(lambda key: "wrt" not in key, zarr_load_keys))
-        replay_buffer = ReplayBuffer.copy_from_path(
-            self.zarr_path, keys=zarr_load_keys)
+        if sample_hz is None:
+            replay_buffer = ReplayBuffer.copy_from_path(
+                self.zarr_path, keys=zarr_load_keys)
+        else:
+            from ImplicitRDP.dataset.forcegello_sampling import load_joint_replay
+            replay_buffer = load_joint_replay(
+                self.zarr_path, zarr_load_keys, self.action_key, float(sample_hz),
+                sample_phase=sample_phase)
 
         if delta_action:
             # replace action as relative to previous frame
@@ -110,15 +130,22 @@ class RealImageTactileDataset(BaseImageDataset):
         self.val_ratio = val_ratio
         self.seed = seed
         self.max_train_episodes = max_train_episodes
-        val_mask = get_val_mask(
-            n_episodes=replay_buffer.n_episodes, 
-            val_ratio=val_ratio,
-            seed=seed)
-        train_mask = ~val_mask
-        train_mask = downsample_mask(
-            mask=train_mask, 
-            max_n=max_train_episodes, 
-            seed=seed)
+        source_ids = getattr(replay_buffer, 'source_episode_ids', None)
+        if source_ids is None:
+            val_mask = get_val_mask(
+                n_episodes=replay_buffer.n_episodes,
+                val_ratio=val_ratio, seed=seed)
+            train_mask = downsample_mask(
+                mask=~val_mask, max_n=max_train_episodes, seed=seed)
+        else:
+            # Keep all phases of one recorded episode in the same split.
+            _, groups = np.unique(source_ids, return_inverse=True)
+            group_val = get_val_mask(
+                n_episodes=int(groups.max()) + 1, val_ratio=val_ratio, seed=seed)
+            group_train = downsample_mask(
+                mask=~group_val, max_n=max_train_episodes, seed=seed)
+            val_mask = group_val[groups]
+            train_mask = group_train[groups]
 
         sampler = SequenceSampler(
             replay_buffer=replay_buffer, 
@@ -198,7 +225,7 @@ class RealImageTactileDataset(BaseImageDataset):
         if self.relative_action or self.rpy_for_rotation:
             action_all = recalculate_data_dict['action']
         else:
-            action_all = self.replay_buffer['action'][:, :self.shape_meta['action']['shape'][0]]
+            action_all = self.replay_buffer[self.action_key][:, :self.shape_meta['action']['shape'][0]]
         normalizer['action'] = get_action_normalizer(action_all)
 
         # obs
@@ -255,10 +282,33 @@ class RealImageTactileDataset(BaseImageDataset):
         return normalizer
 
     def get_all_actions(self) -> torch.Tensor:
-        return torch.from_numpy(self.replay_buffer['action'][:, :self.shape_meta['action']['shape'][0]])
+        return torch.from_numpy(self.replay_buffer[self.action_key][:, :self.shape_meta['action']['shape'][0]])
 
     def __len__(self):
         return len(self.sampler)
+
+    def _observation_indices(self, key: str, sample_index: int, prefix_steps: int) -> np.ndarray:
+        """Select the policy history, with camera frames held on the episode clock."""
+        meta = self.shape_meta['obs'][key]
+        stride = int(meta.get('temporal_downsample_ratio', self.obs_downsample_ratio))
+        count = int(meta.get('n_obs_steps', prefix_steps))
+        hold = int(meta.get('hold_steps', 1))
+        if min(stride, count, hold) < 1:
+            raise ValueError(f'invalid observation sampling for {key}')
+        indices = prefix_steps - 1 - np.arange(count - 1, -1, -1) * stride
+        if key in self.rgb_keys:
+            indices = indices - self.visual_latency_steps
+        if np.any(indices < 0) and key not in self.rgb_keys:
+            raise ValueError(f'observation prefix is too short for {key}')
+        if hold > 1:
+            buffer_start, buffer_end, sample_start, _ = self.sampler.indices[sample_index]
+            ends = self.replay_buffer.episode_ends[:]
+            episode_index = np.searchsorted(ends, buffer_start, side='right')
+            episode_start = 0 if episode_index == 0 else ends[episode_index - 1]
+            absolute = np.clip(buffer_start + indices - sample_start, episode_start, buffer_end - 1)
+            held = episode_start + ((absolute - episode_start) // hold) * hold
+            indices = held - buffer_start + sample_start
+        return indices
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         threadpool_limits(1)
@@ -272,11 +322,21 @@ class RealImageTactileDataset(BaseImageDataset):
 
         obs_dict = dict()
         for key in self.rgb_keys:
-            T_slice = slice(self.n_obs_steps)
+            if self.forcegello_sampling:
+                prefix_steps = self.n_obs_steps if self.n_obs_steps is not None else self.horizon + self.n_latency_steps
+                indices = self._observation_indices(key, idx, prefix_steps)
+                if np.any(indices < 0):
+                    buffer_start, _, sample_start, _ = self.sampler.indices[idx]
+                    absolute = buffer_start + indices - sample_start
+                    frames = np.stack([self.replay_buffer[key][int(i)] for i in absolute])
+                else:
+                    frames = data[key][indices]
+            else:
+                frames = data[key][:self.n_obs_steps][::-obs_downsample_ratio][::-1]
             # move channel last to channel first
             # T,H,W,C
             # convert uint8 image to float32
-            obs_dict[key] = np.moveaxis(data[key][T_slice][::-obs_downsample_ratio][::-1],-1,1
+            obs_dict[key] = np.moveaxis(frames,-1,1
                 ).astype(np.float32) / 255.
             # T,C,H,W
             # save ram
@@ -284,11 +344,16 @@ class RealImageTactileDataset(BaseImageDataset):
                 del data[key]
         for key in self.lowdim_keys:
             if 'wrt' not in key:
-                T_slice = slice(self.n_obs_steps)
+                if self.forcegello_sampling:
+                    prefix_steps = self.n_obs_steps if self.n_obs_steps is not None else self.horizon + self.n_latency_steps
+                    indices = self._observation_indices(key, idx, prefix_steps)
+                    selected = data[key][indices]
+                else:
+                    selected = data[key][:self.n_obs_steps][::-obs_downsample_ratio][::-1]
                 if len(self.shape_meta['obs'][key]['shape']) == 1:
-                    obs_dict[key] = data[key][:, :self.shape_meta['obs'][key]['shape'][0]][T_slice][::-obs_downsample_ratio][::-1].astype(np.float32)
+                    obs_dict[key] = selected[:, :self.shape_meta['obs'][key]['shape'][0]].astype(np.float32)
                 elif len(self.shape_meta['obs'][key]['shape']) == 2:
-                    obs_dict[key] = data[key][:, :self.shape_meta['obs'][key]['shape'][0], :self.shape_meta['obs'][key]['shape'][1]][T_slice][::-obs_downsample_ratio][::-1].astype(np.float32)
+                    obs_dict[key] = selected[:, :self.shape_meta['obs'][key]['shape'][0], :self.shape_meta['obs'][key]['shape'][1]].astype(np.float32)
                 else:
                     raise ValueError(f"Only support 1d or 2d obs")
                 # save ram
@@ -321,7 +386,7 @@ class RealImageTactileDataset(BaseImageDataset):
                     raise ValueError(f"Only support 1d or 2d extended obs")
                 del data[key]
 
-        action = data['action'][:, :self.shape_meta['action']['shape'][0]].astype(np.float32)
+        action = data[self.action_key][:, :self.shape_meta['action']['shape'][0]].astype(np.float32)
         # handle latency by dropping first n_latency_steps action
         # observations are already taken care of by T_slice
         if self.n_latency_steps > 0:
